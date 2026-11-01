@@ -2,7 +2,7 @@
 
 更新日：2026-11-02
 
-状態：詳細設計レビュー用の清書版。未確定事項は14節、技術検証の結果と残項目は[技術確認記録](detailed-design-validation.md)13節に集約する。アプリ本体・その自動テスト・本番exe・配布受入確認は未実施。
+状態：実装前に具体化する設計事項と基礎検証を整理済み。確定範囲と実装後への引継ぎは14節、技術検証の結果と残項目は[技術確認記録](detailed-design-validation.md)13節に集約する。アプリ本体・その自動テスト・本番exe・配布受入確認は未実施。
 
 ## 1. 根拠・設計の境界
 
@@ -163,6 +163,19 @@ Playwright同期APIのイベント内では、必要項目を抽出してメモ�
 
 document・対象Aura要求・本文画像以外の応答は記事の成否へ使わない。401～409・その他4xxは、その取得回の関連通信であることを確認して分類する。ログイン画面を同時検出した場合の優先順位は基本設計10.1節に従う。
 
+### 7.3 ログイン切れの確定条件
+
+取得回のメインフレームで、次のすべてを確認した場合に既知の認証入力画面と判定する。自動ログインや入力・送信は行わない。
+
+- 最終文書のHTTPが200で、オリジンは `https://us.auth.blackline.com`。
+- pathnameが `^/app/blus-production_blacklinesalesforcecommunity_1/[A-Za-z0-9]+/sso/saml$` に一致する。クエリの値は判定・記録に使用しない。
+- 文書がcompleteで、URLと次の構造が250ms間隔の連続2回で一致する。
+- 可視の `input#identifier[name="identifier"][type="text"]` が1件あり、formのactionのオリジン・pathnameが現在文書と一致する。記事コンポーネントは0件。
+
+この画面は未認証の独立コンテキストで実測した識別子入力段階であり、password欄を必須にしない。関連通信の400・410～499やログ保存失敗等の全体停止を最優先し、401～409があれば認証画面を同時検出してもスキップする。そのいずれもなく、上記画面を確認した場合を `AUTH_EXPIRED` とする。
+
+SAML中継先への転送だけ、本文不足だけ、未知の認証画面だけでは確定しない。既知画面へ到達せず記事も完成しない場合は、共通のページ期限内で確認した後、記事取得失敗として扱う。判定直前に取得回の監視キューにある関連応答を処理する。実測・正常系と境界例は技術確認記録14節を参照する。
+
 ## 8. 本文抽出・完成判定
 
 ### 8.1 抽出対象
@@ -170,6 +183,10 @@ document・対象Aura要求・本文画像以外の応答は記事の成否へ�
 調査済みフィールドセット表示の候補ロケーターは記事 `.acknowltngKnowledgeArticleItem`、記事内タイトル `h1.head-page__title`、本文 `.acknowltngKnowledgeArticleBody` とする。件数が1、可視、タイトルが記事APIと一致することを確認する。
 
 項目の順序・ラベル・値は `fieldSetFields`・`fieldSetLabels`・`fieldSetValues` を基準にする。本文の各項目ラッパーと対応付け、値のある全項目を確認する。値のないキーの欠落は許容する。空の非表示ラッパーは出力しない。非空データを可視DOMから取得できなければ、推測で省略せず記事を失敗にする。
+
+初期対応形式は `isFieldSetCreated=true`、`enhancedArticleDetailView=false`、`showArticleSections=false` の通常フィールドセットとする。項目名・件数を4項目に固定せず、重複しない宣言名の配列順で任意件数を処理する。宣言項目以外に非空の値がある、ラベルが欠ける、対応するラッパー数・順序・ラベルが一致しない場合は失敗とする。APIで未宣言の非空値を省略して成功にしない。
+
+別表示形式は `UNSUPPORTED_ARTICLE_LAYOUT` として記事をスキップする。未知のラッパー・属性は8.2節の比較射影へ保持し、一致のために除去しない。APIとDOMが一致しても、内容を維持する生成規則がない要素は `CONVERSION_ERROR` とし、未確認の意味を推測して変換しない。対応形式の追加は実例の確認と設計更新後に行う。
 
 `lightning-formatted-rich-text` のopen shadow root直下のspan内部から値を取得し、本文比較・Markdown生成・安定確認に同じ抽出結果を使う。ホストの `innerHTML` だけでは値を取得できない。shadow rootの欠落・未知の構造を空本文として成功扱いにせず、APIに非空値がある場合は抽出失敗とする。Playwrightロケーターと通常のDOM APIではShadow DOMの横断動作が異なるため、画像等の件数確認でも区別する。観測根拠は技術確認記録8・11節を参照する。
 
@@ -227,7 +244,43 @@ SVG内部の参照は `#id`、描画属性の `url(#id)` のような文書内�
 
 構造確認後、取得したバイト列から作業ページ内だけのBlobを作り、DOMへ追加しないImageの `decode()` と正の自然寸法を確認する。期限切れ・読込失敗は `IMAGE_INVALID`。自分が作成したBlob URLだけを `finally` でrevokeし、ページが持つ元のblob URLは変更しない。
 
-対応構文の具体化と本番検証器の検証は14節の残項目とする。固定例による試行の成功を、未確認のSVG全般へ適用しない。
+#### 初期プロファイルの要素・属性
+
+許可リストにない要素・属性・名前空間・値構文は `UNSUPPORTED_IMAGE` とする。XML自体が壊れている場合は `IMAGE_INVALID`。名前空間宣言もSVGとXLinkだけを許容し、XLinkはhrefだけに使う。`xml:base` は許可しない。
+
+全要素の共通属性は `id`、`transform`、`fill`、`stroke`、`stroke-width`、`opacity`、`fill-opacity`、`stroke-opacity`、`fill-rule`、`stroke-linecap`、`stroke-linejoin`、`stroke-miterlimit`、`stroke-dasharray`、`stroke-dashoffset` とする。要素別の追加属性は次のとおり。
+
+| 要素 | 追加属性 |
+| --- | --- |
+| svg | x、y、width、height、viewBox、preserveAspectRatio |
+| g・defs・title・desc | なし |
+| rect | x、y、width、height、rx、ry |
+| circle | cx、cy、r |
+| ellipse | cx、cy、rx、ry |
+| line | x1、y1、x2、y2 |
+| polyline・polygon | points |
+| path | d |
+| linearGradient | x1、y1、x2、y2、gradientUnits、gradientTransform、spreadMethod、href |
+| radialGradient | cx、cy、r、fx、fy、fr、gradientUnits、gradientTransform、spreadMethod、href |
+| stop | offset、stop-color、stop-opacity |
+| use | x、y、width、height、href |
+
+svg・g・defsの子には図形要素、use、svg・g・defs、グラデーション、title・descを許す。グラデーションの子はstop・title・desc、図形・useの子はtitle・desc、stop・title・descの子要素は許さない。空白以外の文字データはtitle・desc内だけに許す。text・image・style等は初期範囲外であり、文字や画像を黙って削除して保存しない。
+
+#### 値と参照の検証
+
+- 数値はASCIIの符号付き整数・小数・指数表記で、有限値だけを許す。単一の長さには単位なし、px・pt・pc・in・cm・mm・%を許し、width・height・半径・stroke-widthの負数は拒否する。
+- opacity類とstopのoffsetは単位なしの0～1、stroke-miterlimitは1以上。dasharrayはnoneまたは非負の数列。pointsは偶数個の数列とし、polylineは2点以上、polygonは3点以上。
+- 色はPillowの `ImageColor.colormap` にある名前、3・4・6・8桁の16進表記、transparentを許す。fill・strokeにはnoneまたは厳密な `url(#id)` も許す。CSS関数・変数・エスケープ等の未対応表記は拒否する。
+- viewBoxは4数で幅・高さは正数。preserveAspectRatioはnone、またはxMin/xMid/xMaxとYMin/YMid/YMaxの組に任意のmeet/sliceを付けた形とする。
+- fill-ruleはnonzero/evenodd、linecapはbutt/round/square、linejoinはmiter/round/bevel、gradientUnitsはuserSpaceOnUse/objectBoundingBox、spreadMethodはpad/reflect/repeat。
+- transform類はmatrix(6数)、translate・scale(1または2数)、rotate(1または3数)、skewX・skewY(1数)の列。未知関数・残余文字・非有限値を拒否する。
+- pathはMから始め、M/L/H/V/C/S/Q/T/A/Zの大小文字と規定数の引数群を検証する。Aの半径は非負、両フラグは0/1。対応外の省略表記を推測して補完しない。空のdは許容する。
+- idは `[A-Za-z_][A-Za-z0-9_.-]*` に一致する重複しない値とし、前後空白を勝手に補正しない。hrefは `#id` だけを許す。hrefとxlink:hrefの併記は拒否する。
+- 全XML解析後に前方参照を解決する。paintの参照先はグラデーション、グラデーションのhrefは同種グラデーション、useのhrefは図形・use・g・svgに限る。存在しないIDを拒否する。
+- 子要素への辺と参照先への辺を併せたグラフを走査し、直接・間接・祖先参照を含む循環を拒否する。外部参照先へアクセスしない。
+
+設計用の実行可能な試行は [svg_profile_probe.py](../tools/validation/svg_profile_probe.py)、正常例のブラウザデコードと期限処理は技術確認記録14節を参照する。このプロファイルを本体へ実装した後にも同じ境界例で再確認する。
 
 ## 10. Markdown・YAML・ハッシュ
 
@@ -286,7 +339,7 @@ JSONの外部変更検出は「確認時点のハッシュ一致」であり、O
 | fetch / HTTP_SKIP | 401～409、失敗1件、次のURL前に規定待機 |
 | fetch / HTTP_FATAL | 400・410～499、全体停止 |
 | fetch / AUTH_EXPIRED | 401～409のスキップ優先を除き、確定したログイン切れで全体停止 |
-| fetch / ARTICLE_API_ERROR・ARTICLE_ID_MISMATCH・BODY_MISMATCH・SNAPSHOT_CHANGED | 記事失敗として続行 |
+| fetch / ARTICLE_API_ERROR・ARTICLE_ID_MISMATCH・BODY_MISMATCH・SNAPSHOT_CHANGED・UNSUPPORTED_ARTICLE_LAYOUT | 記事失敗として続行 |
 | image / IMAGE_INVALID・UNSUPPORTED_IMAGE | 記事失敗として続行 |
 | convert・save / CONVERSION_ERROR・SAVE_ERROR・PATH_TOO_LONG | 記事失敗として続行 |
 | input_update / INPUT_CHANGED・INPUT_UPDATE_ERROR | 全体停止。成果物と先行完了記録を維持 |
@@ -315,16 +368,16 @@ Ctrl+Cは `KeyboardInterrupt` として扱い、後続URLを開始せずコー�
 
 技術的な根拠（2026-11-01確認）：[PlaywrightリクエストAPI](https://playwright.dev/python/docs/api/class-apirequestcontext)、[Python msvcrt.locking](https://docs.python.org/3/library/msvcrt.html)、[Windows命名規則](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)、[PyYAML SafeLoader](https://pyyaml.org/wiki/PyYAMLDocumentation)、[Pillowの画像形式](https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html)、[SVGの画像コンテキスト](https://developer.mozilla.org/en-US/docs/Web/SVG/Guides/SVG_as_an_image)、[HTML template](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/template)。PyYAMLは既存フロントマターの読込、Pillowはラスタ画像の形式識別とデコード検証に用途を限定する。
 
-## 14. 未確定事項と検証への引継ぎ
+## 14. 設計確定範囲と実装後への引継ぎ
 
-以下は、関連処理の実装前に具体化・確認する事項である。
+実装前に残っていた3項目は、次の有限な対応範囲と失敗時の動作で具体化した。対応範囲外を成功扱いにしない。
 
-| 項目 | 確定に必要な内容 |
+| 項目 | 確定した設計と根拠 |
 | --- | --- |
-| ログイン切れ | 未認証時のSAML転送は観測済みだが、最終画面は未確認。本文不足や転送だけで誤判定しないための画面・URLの識別条件 |
-| 未確認の本文構造 | 通常フィールドセット以外の識別、未確認のラッパー・意味属性の扱い。既知の規則で全項目を取得・照合できないケースは成功扱いにしない |
-| SVG検証器 | 9.3節の範囲を実現する要素・属性・文書内参照の許容規則。固定例の試行を網羅的な本番検証器とみなさない |
+| ログイン切れ | 7.3節。未認証時の識別子入力画面を実測し、URL・HTTP・可視入力欄・form・記事不在を組み合わせる。HTTPとの優先順位もダミー検証 |
+| 本文構造 | 8.1・8.2節。通常フィールドセットの全宣言項目を照合し、未知の構造・非空の欠落・変換不能は記事失敗。6項目・順序変更・欠落・非表示・Shadow DOMの境界を検証 |
+| SVG検証器 | 9.3節の初期プロファイル。要素・属性・値・文書内参照を有限に定義し、欠落参照・循環・外部依存・未知構文を拒否。Pythonで構造、ブラウザで正常例と期限切れ処理を検証 |
 
-共通処理はこれらと分け、未確定事項に依存する実装は該当条件を確定してから進める。要件・外部契約の変更が必要になった場合は、理由と影響を示して合意後に各文書へ反映する。
+上記は初期対応範囲の設計確定であり、全表示形式・全SVG・すべての認証フローを取得できるという保証ではない。要件・外部契約の変更が必要になった場合は、理由と影響を示して合意後に各文書へ反映する。
 
 現在の技術検証の結果・残項目・未実施理由は、[技術確認記録](detailed-design-validation.md)13節に集約する。本体の結合・異常系・本番exeの確認は実装後、シンボリックリンクやPython未導入の別PCなど環境依存の確認は対応環境で行う。試行コード・検証exeの成功をアプリ本体の受入合格とは扱わない。

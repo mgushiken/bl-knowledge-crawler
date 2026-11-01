@@ -13,6 +13,7 @@ $env:UV_LINK_MODE = 'copy'
 uv pip install --python .venv/Scripts/python.exe -r requirements-validation.txt
 .venv/Scripts/python.exe tools/validation/dependency_probes.py
 .venv/Scripts/python.exe tools/validation/merged_table_probe.py
+.venv/Scripts/python.exe tools/validation/svg_profile_probe.py
 .venv/Scripts/python.exe tools/validation/dependency_smoke.py
 ```
 
@@ -23,6 +24,10 @@ uv pip install --python .venv/Scripts/python.exe -r requirements-validation.txt
 Playwriterの自分専用セッションをポート9223へ接続し、`browser_fixture_probes.js` をCLIの `-s <自分のセッションID> -f tools/validation/browser_fixture_probes.js` で実行する。実行後にそのセッションを削除する。CLIの接続例は `playwriter session new --direct 127.0.0.1:9223 --tab-group validation`。
 
 スクリプトは自分で作成したabout:blankタブだけを使い、finallyで閉じる。example.invalid向け要求はタブ内ルートで応答する。出力するbase64は自作の3×2 PNGだけであり、実画像・記事本文・Cookieは扱わない。最後の `DUMMY_BYTES=` の値をPythonで厳密base64復号・Pillow検証することで受渡しを再確認できる。
+
+詳細設計の確定検証は、同じCLIの自分のセッションで `final_browser_probes.js` を実行する。自作タブ内で認証判定・本文構造・SVGの137ケースを確認し、HTTP(S)要求はタブルートで中断する。`svg_profile_probe.py` の正常SVG11例をブラウザ側でも使うため、例を変更する場合は両方へ反映する。
+
+`auth_observation_probe.js` は実サイトの読取であり、自分専用の未認証コンテキストで既調査記事とその認証先を開く。既存のログイン状態は変更せず、識別子や認証情報を入力・送信しない。URLのオリジン・パスと画面構造だけを出力してfinallyでコンテキストを閉じる。実施時点の画面やネットワーク条件が変われば、過去の肯定結果を流用せず確認する。
 
 ## 検証exeのビルド
 
