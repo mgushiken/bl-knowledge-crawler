@@ -28,7 +28,7 @@ URL一覧作成アプリの出力をユーザーが作業用JSONへコピーし�
 | 入力JSON更新 | 正常完了した要素の `is_new` の安全な書き戻し |
 | 運用出力・排他 | ログ、件数表示、入力JSONと保存先の同時使用防止 |
 
-実装はPython、ブラウザ接続はPlaywrightの同期APIとCDP、HTML変換はmarkdownify、exe化はPyInstallerのonefile方式とする。既存YAMLの読込はPyYAML、画像形式・デコード検証はPillowを用途を限定して使用する。JSON・TOML・ハッシュ・パス・待機は標準ライブラリで扱う。リポジトリ専用仮想環境を使用し、Pythonと依存の版は環境構築時に確認・固定する。
+実装はPython、ブラウザ接続はPlaywrightの同期APIとCDP、HTML変換はmarkdownify、exe化はPyInstallerのonefile方式とする。既存YAMLの読込はPyYAML、画像形式・デコード検証はPillowを用途を限定して使用する。JSON・TOML・ハッシュ・パス・待機は標準ライブラリで扱う。リポジトリ専用の `.venv` を使用し、Pythonは `.python-version` に3.15.2を固定した。依存ライブラリの互換版固定は未実施で、環境検証時に行う。
 
 [PlaywrightのCDP接続](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp)には専用プロトコルより機能上の制限がある。[コンテキストのリクエストAPI](https://playwright.dev/python/docs/api/class-apirequestcontext)はCookieを共有し、画像取得の基本方式に使用する。変換・配布方式の根拠は[markdownify公式配布情報](https://pypi.org/project/markdownify/)と[PyInstallerの使用方法](https://pyinstaller.org/en/stable/usage.html)。公式資料確認日：2026-11-01。
 
@@ -259,6 +259,7 @@ Cookie・認証ヘッダー・トークン・本文・生の例外文字列を�
 - 同じJSONなら保存先が違っても、同じ保存先ならJSONが違っても同時実行しない。
 - 取得順を固定してすべてのロックを確保し、確保できなければ巡回開始を待機せず起動エラーとする。
 - 絶対パス化、既存親の解決、大文字小文字・別名・リンクによる同一実体の判定方法は詳細設計で定める。
+- 入力JSONは実パス解決後にハードリンク数を確認し、複数リンクを持つ場合は起動エラーとする。リンクを勝手に切断・複製しない。
 - 入力の手作業編集は停止中に行う。ロックを尊重しない外部編集には書き戻し前の変更検出も併用するが、完全な競合防止を保証しない。
 - ローカルロックはOneDrive等を通じ別PCへ共有されない。同じ同期先・作業用JSONを別PCから同時変更しないことは利用者の運用制約とし、分散ロックは追加しない。
 
