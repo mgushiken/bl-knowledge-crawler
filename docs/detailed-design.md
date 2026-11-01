@@ -1,0 +1,251 @@
+# 詳細設計書 — BlackLine Knowledge 取得アプリ
+
+作成日：2026-11-01
+
+状態：詳細設計初稿。共通処理の実装単位とアルゴリズムを定義した。サイト固有条件の検証待ちは14節に記載する。実装・環境構築・自動テスト・exeビルドは未実施。
+
+## 1. 根拠・設計の境界
+
+[要件定義書](requirements.md)、[基本設計書](basic-design.md)、[限定調査記録](knowledge-article-observations.md)を根拠とする。外部契約・設定名・保存形式を本書で独立して変更しない。参照クローラーの停止・監視・進捗管理をそのまま移植しない。
+
+以下は実装予定の構成であり、ファイルや関数が存在することを示さない。純粋処理とI/Oを分け、単純なdataclassと関数を中心とする。汎用クローラーフレームワーク・プラグイン機構は設けない。
+
+## 2. ファイル・モジュール構成
+
+```text
+run_knowledge_crawler.py
+src/bl_knowledge_crawler/
+  __init__.py
+  app.py
+  model.py
+  config.py
+  input_store.py
+  locking.py
+  browser.py
+  network.py
+  extractor.py
+  images.py
+  document.py
+  storage.py
+  operations.py
+tests/
+  fixtures/knowledge/       # ダミーHTML・通信・画像のみ
+scripts/build.ps1
+settings.example.toml
+```
+
+| モジュール | 主要インターフェース・責務 |
+| --- | --- |
+| app | `main() -> int`、`run(settings, dependencies) -> RunResult`。逐次制御と例外の境界 |
+| model | 値オブジェクト・固定例外・列挙値。I/Oなし |
+| config | `get_app_dir()`、`load_settings(path) -> Settings`。TOML・型・パスの検証 |
+| input_store | `load_input(path)`、`validate_entry(value, index)`、`mark_completed(index)`。JSON保持・原本比較・置換 |
+| locking | `acquire_resources(input_path, output_dir)`。入力と保存先の排他 |
+| browser | `BrowserSession.open()`、`new_work_page()`、`close_work_page()`、`disconnect()`。既存Chromeを維持 |
+| network | `ActionMonitor.start(page, attempt_id)`、`resolve_article(deadline)`。要求・応答の相関 |
+| extractor | `read_snapshot(page, article_data, deadline)`、`wait_stable(...)`。記事領域・項目・画像参照の抽出 |
+| images | `fetch_images(context, refs, workspace, timeout)`。認証付きGET・形式検証・内容ハッシュ |
+| document | `build_candidate(snapshot, images)`。Markdown・フロントマター・比較用ハッシュ |
+| storage | `scan_existing(root)`、`plan_save(candidate, existing)`、`commit_save(plan)`。比較・保存・修復 |
+| operations | `Deadline`、`write_error(error)`、`write_diagnostic(...)`、件数表示。秘密値を出力しない |
+
+ブラウザ取得結果は、タブを閉じても利用できる値と一時画像パスで返す。Playwrightオブジェクトを保存層へ渡さず、ログ層へHTML・画像・通信の生オブジェクトを渡さない。時刻・乱数・待機・セッション生成は関数引数で差し替え可能にし、テストのための大きな基盤は追加しない。
+
+## 3. 内部データ・例外
+
+| 型 | 主なフィールド |
+| --- | --- |
+| Settings | input_path、output_dir、error_dir、interval_seconds、jitter_seconds、3種のtimeout_seconds |
+| RunContext | run_id（UUID）、started_at、workspace、counts、execution_failed、cleanup_failed |
+| InputDocument | 元のJSONツリー、読込バイト列のSHA-256、入力パス。元データを明示的に保持 |
+| Entry | index（0始まり）、input_url、canonical_url、url_hash。正常なtrueだけ取得対象 |
+| InvalidEntry | index、固定reason_code。入力値の全文は保持・出力しない |
+| ArticleIdentity | attempt_id、url_name、article_version_id、record_type_name。実行メモリ内のみ |
+| ArticleField | name、label、source_html、dom_html、表示状態。順序はAPIの宣言順 |
+| PageSnapshot | input_url、canonical_url、final_url、title、fields、image_refs、比較用DOM射影 |
+| ImageRef / ImageAsset | 項目・出現位置の識別子、取得URL（メモリ内のみ）／hash、extension、temp_path |
+| DocumentCandidate | title、source_url、body、hash_body、content_hash、images、fetched_at |
+| ExistingDocument | path、source_urlの復元可否、検証済みメタデータ、破損理由、本文 |
+| SavePlan | kind（new / unchanged / update / repair）、target、同一URLの旧パス群、日時、画像反映計画 |
+| RunResult | counts、exit_code、execution_error_code。ブラウザや入力全文を含めない |
+
+HTML・取得URL等を含むフィールドはdataclassの `repr` へ出さない。画像ハッシュ・URLハッシュは小文字16進の全64桁、メタデータでは内容ハッシュに `sha256:` を付ける。
+
+`ArticleError` は記事単位の失敗、`RunError` は全体停止とする。いずれも `code`、`stage`、`input_index`、安全な記事URL、任意のHTTPステータス、固定messageを持つ。生の例外文を利用者向け文字列へ連結しない。`KeyboardInterrupt` は最外周で捕捉し、終了コード1へ変換する。
+
+## 4. 設定・JSONの読込
+
+### 4.1 設定
+
+exeでは `Path(sys.executable).parent`、ソースでは入口スクリプトの親を基準とする。PyInstallerの内部展開先やカレントディレクトリを設定基準にしない。
+
+1. `tomllib` で設定を読み、基本設計3節のセクション・項目を検証する。未知キー・必須値欠落・型不正は `CONFIG_ERROR`。
+2. 時間値は `type(value) in (int, float)`、有限値を要求し、真偽値は拒否する。待機は0以上、期限は正数、揺らぎは基準以下。
+3. 空パス・ドライブ相対パス（`C:folder`）を拒否し、相対パスを設定ファイル基準で解決する。JSONは既存ファイル、出力・ログはフォルダとして扱う。
+4. 出力とログの一致・包含関係、入力ファイルが出力・ログ生成で上書きされる配置を拒否する。副作用の前に設定を一通り検証する。
+5. 出力・ログの親を必要に応じて作成する。ログ先を使えない設定障害では基本設計10.3節の代替先と標準エラーを用いる。
+
+秒は内部で保持し、Playwright呼出し時だけミリ秒へ変換する。設定例の各値には用途・秒単位・ファイルとフォルダの違い・相対パス基準をコメントで説明する。
+
+### 4.2 JSON
+
+`object_pairs_hook` で重複キーを拒否し、`parse_constant` でNaN・Infinityを拒否する。最上位と `urls` の型を確認した後、配列を入力順で検証する。正常falseは取得せず、不正要素は値を変更せず失敗記録の対象にする。
+
+URLは `urlsplit` で基本設計4.2節の許容形式を検証する。空の記事名、ユーザー情報、クエリ・フラグメント、余分なポートは不正要素。正常URLのパスを勝手にデコード・再エンコードしない。記事同一性用の正規化と、API要求の `urlName` 照合用のデコードを混同しない。
+
+未知のJSON項目をfloat変換で丸めないため、非整数のJSON数値は `Decimal` として保持する。書き戻しは文字列・整数・有限Decimal・真偽値・null・配列・辞書を再帰的に出力し、文字列のエスケープは標準 `json` に任せる。Decimalを文字列型へ変換しない。再解析結果が、対象の真偽値以外について読込ツリーと等しいことを検証する。比較では真偽値と数値を型で区別し、Pythonの `True == 1` をJSON値の同一性とみなさない。この数値保持処理はダミーの極小数・大きな整数・未知の入れ子項目で確認する。
+
+## 5. 排他・パス
+
+### 5.1 ロック
+
+入力JSONの実パスに対する隣接ロックファイルと、保存ルートの `.bl-knowledge-crawler.lock` を使う。入力ロックは `<入力ファイル名>.bl-knowledge-crawler.lock` とし、JSONの置換後も同じロックファイルを保持する。ロックファイルは存在してよく、存在自体を実行中の印としない。
+
+`msvcrt.locking` の `LK_NBLCK` で先頭1バイトを非待機でロックする。必要な1バイトを準備し、ファイル位置を0へ戻してから取得する。正規化したロックパス順で全ロックを取得し、途中失敗時は取得済みを逆順で解放する。ハンドルは実行全体で保持し、終了時に解放・closeする。JSON読込・成果物変更は全ロック取得後に開始する。
+
+パスは `resolve()` とWindowsの大文字小文字の正規化で比較する。ジャンクション・シンボリックリンクを解決して同じ実体へ到達する経路を検証する。ハードリンク・短縮名を含む別名検出は14節の検証待ちとし、未検証の同一性保証を宣言しない。別PC間は要件の運用制約による。
+
+### 5.2 生成パス
+
+タイトルのWindows禁止文字と制御文字は `_` に置換し、末尾の空白・ピリオドを除く。空なら `_`、予約名（CON・PRN・AUX・NUL・COM/LPT番号等）なら先頭へ `_` を付ける。元タイトルはフロントマターに保持する。
+
+通常の名前衝突は基本設計8.1節のハッシュ延長で回避する。元URL不明ファイルで全64桁まで占有されていれば、`<タイトル>-<URL全ハッシュ>-recovered-<UUID>.md` を排他的に選ぶ。既存の正常な同一URL記事があればその配置を考慮し、毎回別名を作らない。
+
+パス長への対応・タイトル短縮規則は14節で確定する。作成・置換・削除の直前に解決済みパスが保存ルート内であることを確認する。同一URLと再確認できたMarkdownだけを旧版削除対象にし、ルート外参照やリンク経由の逸脱を許さない。
+
+## 6. 実行制御と状態遷移
+
+```text
+config → lock → input/scan
+→ [validate → fetch → convert → compare → save/repair → mark_completed → count → wait]
+→ cleanup → summary → exit
+```
+
+`attempt_id` は取得要素ごとに生成する。保存済みのURL対応表は保存・修復後に更新し、重複入力が次の要素として現れたときも最新の状態で比較する。取得対象は配列順、不正要素は失敗記録、正常falseは処理しない。
+
+`mark_completed` が成功するまで成功件数を増やさない。記事失敗なら失敗1件・ログ・後始末・規定待機の後に次へ進む。`RunError` またはログ保存失敗なら後続を開始しない。後片付けが失敗した場合も後続処理は開始せず、終了処理を継続してコード1を返す。
+
+作業タブは要素ごとに作り、要素処理の `finally` で自分の監視解除・タブ閉鎖・当該一時領域の後片付けを試みてから次の記事間待機へ進む。Chrome接続は実行全体で保持し、最外周で解放する。JSON更新と成功計上の後にタブ閉鎖等が失敗した場合は成功件数を取り消さず、実行全体の終了処理エラーとしてコード1を返す。失敗を架空の追加URL1件として数えない。
+
+待機は `uniform(interval - jitter, interval + jitter)`。時間制限の計測は `monotonic()`、記録日時はPCのタイムゾーン付き日時を使う。ページ期限はURL移動から初回安定まで共通の残り時間を各呼出しに渡す。残り時間0は「無期限」を意味するAPI値へ渡さず、自前の期限切れにする。
+
+## 7. ブラウザ・Aura通信
+
+### 7.1 セッションと監視
+
+`connect_over_cdp("http://127.0.0.1:9223", timeout=...)` で接続し、既定コンテキストの作業タブだけを使う。ユーザータブを対象にしない。タブのイベントハンドラーは取得回に束縛し、URL移動前に登録、取得回終了時に自分のハンドラーだけを解除する。
+
+Playwright同期APIのイベント内では、必要項目を抽出してメモリ内キューへ積む。DOM操作・別GET・保存をイベント内で行わない。例外をイベント外へ無加工で投げず、固定エラー情報を制御層が取り出す。
+
+### 7.2 ActionMonitor
+
+- キーは `(attempt_id, request_seq, action_id)`。action_id単独では別要求の同名IDを混同するため使わない。
+- 対象要求のフォーム `message` をJSONとして読み、アクションのdescriptor・id・必要な引数だけを射影する。トークン等の他のフォーム値は取り込まない。
+- 対象は基本設計6.2節の3アクション。応答を同じ要求へ対応付け、その中の同じaction_idと結合する。
+- URL末尾に一致する `urlName` のID解決、解決IDを要求した記事情報、その記事ID・recordTypeNameを要求した本文項目の順で確定する。複数ID解決の結果不一致は `ARTICLE_ID_MISMATCH`。
+- 対象アクションが `SUCCESS` で、有効な型の値を持つことを確認する。HTTP 200内のアクションERRORは `ARTICLE_API_ERROR`。
+- 記事情報応答のIDとタイトル、本文項目応答の非空識別情報を照合する。調査で空だったキーを埋めたり、空だけで不一致にしない。
+- HTML返却・JSON解析不能・対象アクション欠落・未完了は、画面だけで成功とせず期限内の確認後に失敗にする。
+
+document・対象Aura要求・本文画像以外の応答は記事の成否へ使わない。401～409・その他4xxは、その取得回の関連通信であることを確認して分類する。ログイン画面を同時検出した場合の優先順位は基本設計10.1節に従う。
+
+## 8. 本文抽出・完成判定
+
+調査済みフィールドセット表示の候補ロケーターは記事 `.acknowltngKnowledgeArticleItem`、記事内タイトル `h1.head-page__title`、本文 `.acknowltngKnowledgeArticleBody` とする。件数が1、可視、タイトルが記事APIと一致することを確認する。
+
+項目の順序・ラベル・値は `fieldSetFields`・`fieldSetLabels`・`fieldSetValues` を基準にする。本文の各項目ラッパーと対応付け、値のある全項目を確認する。値のないキーの欠落は許容する。空の非表示ラッパーは出力しない。非空データを可視DOMから取得できなければ、推測で省略せず記事を失敗にする。
+
+完成確認用の射影は、タイトル、項目順・ラベル・正規化本文、本文画像の参照と出現位置とする。変動するAura属性・操作ボタン・評価欄は含めない。250ms間隔で連続2回一致し、対象APIも成功してから候補を固定する。APIとDOMの比較正規化は14節で検証・固定する。本文の空白を一律に圧縮した値だけで内容一致を判定しない。
+
+遅延画像は本文内で表示位置へ移し、期限内に参照確定を待つ。画像取得前後で同じ射影を比較する。確定候補から変われば `SNAPSHOT_CHANGED` としてスキップし、ページを再読込しない。
+
+## 9. 画像取得と形式検証
+
+出現位置ごとに `currentSrc`、未設定なら `src` を解決する。同じ取得URLの画像は同じ記事の取得回内で1度取得し、結果を各位置へ割り当てる。本文上の画像順序・代替テキストは保持する。
+
+HTTP(S)画像は `context.request.get(url, timeout=..., max_retries=0, max_redirects=0, fail_on_status_code=False)` で取得する。401～409は記事スキップ、その他4xxは全体停止、3xx・5xx・通信失敗は記事スキップ。応答は `finally` で `dispose()` し、ステータスやURLの生データを例外文へ埋めない。
+
+画像検証にはPillowを使用する。最初の対応形式はPNG・JPEG・GIF・WebP・BMPとし、実データの識別結果から `.png`・`.jpg`・`.gif`・`.webp`・`.bmp` を選ぶ。`verify()` 後に開き直してデコードを確認し、複数フレーム形式は各フレームを確認する。元のバイト列を保存し、再圧縮・形式変換はしない。HTTPのMIME不一致は診断情報とし、実データが有効なら許容する。
+
+SVG・data URI・blob・上記以外の形式は検証待ちとして分離する。未対応のものが本文に現れた場合は `UNSUPPORTED_IMAGE` で記事を失敗にし、画像を黙って落とさない。Pillowのデコード制限を無効化して未知データを無理に受け入れない。
+
+## 10. Markdown・YAML・ハッシュ
+
+項目ラベルをH2、各リッチテキスト値を本文として順に組み立て、markdownifyで変換する。元本文の見出し・表・リンク・コード・改行を維持する設定を固定する。同じ記事タイトルを先頭H1へ重複追加しない。変換器の設定と版はダミーHTMLによる出力確認後に固定する。
+
+画像変換フックから、表示用本文には保存相対パス、ハッシュ用本文には `bl-image-sha256:<全64桁>` を出力する。同じ変換工程で生成し、完成MarkdownのURLを曖昧な文字列置換で再解析しない。通常リンク・添付リンクは元の参照関係を保持し、ダウンロードしない。
+
+改行をLFにし、本文末尾のLFだけを1つに固定する。内容ハッシュは `sha256((title + "\n" + hash_body).encode("utf-8"))`。画像一覧は `(root_relative_path, hash)` を重複排除・パス順に並べ、本文上の出現順とは分離する。
+
+フロントマターは基本設計8.2節のキー順で出力する。PyYAMLのSafeLoader系で重複キーを拒否して読み、任意オブジェクトを生成しない。日時は文字列として出力し、ローダーの暗黙の日時変換に依存しない。既存値の型・ハッシュ・ルート相対画像パスを検証する。元URLだけを安全に復元できた破損と、元URL不明の破損を区別する。
+
+`fetched_at` は本文・画像取得後、`created_at`・`updated_at` は最終反映直前に採取する。更新時は初版日時を維持し、修復で復元不能な場合だけ再設定する。同一URLの候補のうち有効な日時をUTCの瞬間として比較し、最も早い値を引き継ぐ。
+
+## 11. 保存計画・JSON書き戻し
+
+`scan_existing` は保存ルート直下のMarkdownを走査し、正常・元URL復元可能な破損・元URL不明に分ける。元URL不明ファイルを入力記事とファイル名だけで結び付けない。新規・更新・修復・無変更を `SavePlan` に確定してから最終反映する。
+
+1. `%LOCALAPPDATA%/BlackLineKnowledgeCrawler/tmp/<run_id>/<attempt_id>/` に今回の取得物を生成する。他の実行の残留物は削除しない。
+2. 画像を最終配置と同じフォルダの一時ファイルに書き、flush・fsync・close後に置換する。既存同名画像は内容ハッシュを検証する。
+3. Markdownを最終配置と同じフォルダの一時ファイルから置換する。直前にも対象の元URL・占有状態を再確認する。
+4. 改名・重複は新版の検証後に同じ元URLの旧Markdownだけ削除する。更新・修復後に対応表を更新する。
+5. 入力JSONの現在バイト列のハッシュが前回読込または書き戻し直後の値と一致することを確認する。
+6. JSONツリーの当該indexだけをfalseにし、同じフォルダの一時ファイルへ保存・再読込・保持値検証をして置換する。失敗時はメモリ上の更新を確定済みと扱わない。
+7. 成功したJSONのバイト列ハッシュを次の比較基準に更新し、処理結果を成功件数へ反映する。
+
+画像・Markdown・JSONを単一トランザクションとは扱わない。JSON更新前に中断すれば `true` のまま再取得・比較する。書き戻し失敗時は成果物を維持して全体停止する。不要な旧画像の削除・失敗時の一括ロールバックは行わない。
+
+## 12. エラー・終了・ログ
+
+| stage / codeの例 | 分類・処理 |
+| --- | --- |
+| config / CONFIG_ERROR | 全体停止、ログまたは代替出力 |
+| lock / RESOURCE_BUSY | 待機せず全体停止 |
+| input / INPUT_DOCUMENT_ERROR | 取得前に全体停止 |
+| validate / INVALID_ENTRY | 失敗1件、当該要素の値を保持して続行 |
+| fetch / HTTP_SKIP | 401～409、失敗1件、次のURL前に規定待機 |
+| fetch / HTTP_FATAL | 400・410～499、全体停止 |
+| fetch / AUTH_EXPIRED | 401～409のスキップ優先を除き、確定したログイン切れで全体停止 |
+| fetch / ARTICLE_API_ERROR・ARTICLE_ID_MISMATCH・SNAPSHOT_CHANGED | 記事失敗として続行 |
+| image / IMAGE_INVALID・UNSUPPORTED_IMAGE | 記事失敗として続行 |
+| convert・save / CONVERSION_ERROR・SAVE_ERROR | 記事失敗として続行 |
+| input_update / INPUT_CHANGED・INPUT_UPDATE_ERROR | 全体停止。成果物と先行完了記録を維持 |
+| log / LOG_WRITE_ERROR | 代替ログ・表示を試み、成否にかかわらず全体停止 |
+| cleanup / CLEANUP_ERROR | 他の後始末も試み、コード1。成果物・完了記録を維持 |
+
+全64桁でも別URLと保存名が衝突する場合は基本設計8.1節の異常終了とする。エラー優先順位はログ保存失敗・JSON更新失敗等の全体停止を記事スキップより優先する。HTTPとログイン画面の同時検出は基本設計の規則に従う。
+
+Ctrl+Cは `KeyboardInterrupt` として扱い、後続URLを開始せずコード1にする。`finally` でタブ閉鎖、接続解放、一時領域の後片付け、ロック解放をそれぞれ試み、一つの失敗で残りを省略しない。既にfalseへ書き戻した要素は戻さない。強制終了・電源断のログや最終表示は保証しない。
+
+ログは基本設計10.3節の項目だけから生成する。`input_index` はJSONの0始まり位置とし、不明ならnull。名前は `error-<UTC日時>-<run_id>-<UUID>.json`、修復等の診断情報は `diagnostic-...json` として区別する。ログ自体の失敗を同じロガーへ再帰的に渡さない。指定先失敗で代替保存できても続行しない。
+
+## 13. 検証と根拠
+
+本節は検証計画であり、実施結果ではない。通常のテストは標準unittestとダミー資料を基本とし、実装の固定値をなぞるだけのテストを作らない。
+
+| 検証群 | 主な確認点 |
+| --- | --- |
+| 純粋処理 | 型・URL・数値保持、設定基準、正規化、内容ハッシュ、YAMLの安全な読込 |
+| 通信・DOM | 多重アクション、別要求の同じid、前記事の遅延応答、空識別値、非空項目のDOM欠落 |
+| 画像・変換 | MIMEとPNG署名不一致、壊れたデータ、画像差し替え、表・コード・リンクの保持 |
+| 保存・中断 | 反映各段階の失敗、旧版削除失敗、JSON外部変更、初版日時、未知項目・配列順保持 |
+| 排他・終了 | 同一入力・同一保存先、異常終了後の解除、Ctrl+C、後始末の独立試行 |
+| ログ・集計 | 指定先失敗・代替先失敗、秘密値の非出力、JSON更新失敗の二重計上防止 |
+| 配布 | Python未導入Windows 11、作業ディレクトリ非依存、一意なdist出力、旧exe維持 |
+
+実装用クラス・関数の前には責務・意図のブロックコメントを置く。画像MIME不一致や空識別値など実測由来の例外処理は、必要となった理由と調査記録への参照を残す。
+
+技術的な根拠（2026-11-01確認）：[PlaywrightリクエストAPI](https://playwright.dev/python/docs/api/class-apirequestcontext)、[Python msvcrt.locking](https://docs.python.org/3/library/msvcrt.html)、[Windows命名規則](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)、[PyYAML SafeLoader](https://pyyaml.org/wiki/PyYAMLDocumentation)、[Pillowの画像形式](https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html)。PyYAMLは既存フロントマターの読込、Pillowは形式識別とデコード検証に用途を限定する。
+
+## 14. 検証待ち・実装開始前の確認
+
+| 項目 | 必要な確認 |
+| --- | --- |
+| APIとDOMの正規化 | 実際のラッパー・エンティティ・段落・改行を比較する規則をダミー資料で固定。未検証の単純な空白圧縮を採用しない |
+| 表示形式 | 通常フィールドセット以外、非表示に値がある項目、複数画像・遅延読込の判定 |
+| 特殊画像 | SVG・data URI・blob等の対応手順。未対応形式を成功扱いにしない |
+| ログイン切れ | 401～409以外で全体停止と確定できるURL・画面の根拠。実ログアウト・Cookie削除は行わない |
+| パス | 長いタイトル・絶対パスの処理、短縮名・ハードリンク等の同一性検出、ロックファイルの実環境確認 |
+| 依存・配布 | Python・Playwright・markdownify・PyYAML・Pillow・PyInstallerの互換版固定、ドライバー同梱、既存Chromeを維持する切断方法 |
+
+共通処理の設計とサイト固有の検証待ちを分け、後者に依存する本番処理は確認後に実装する。要件や基本設計の契約変更が必要な場合は、理由・影響を示して合意後に各文書へ反映する。
