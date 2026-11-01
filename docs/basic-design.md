@@ -28,7 +28,7 @@ URL一覧作成アプリの出力をユーザーが作業用JSONへコピーし�
 | 入力JSON更新 | 正常完了した要素の `is_new` の安全な書き戻し |
 | 運用出力・排他 | ログ、件数表示、入力JSONと保存先の同時使用防止 |
 
-実装はPython、ブラウザ接続はPlaywrightの同期APIとCDP、HTML変換はmarkdownify、exe化はPyInstallerのonefile方式とする。既存YAMLの読込はPyYAML、画像形式・デコード検証はPillowを用途を限定して使用する。JSON・TOML・ハッシュ・パス・待機は標準ライブラリで扱う。リポジトリ専用の `.venv` を使用し、Pythonは `.python-version` に3.15.2を固定した。依存ライブラリの互換版固定は未実施で、環境検証時に行う。
+実装はPython、ブラウザ接続はPlaywrightの同期APIとCDP、HTML変換はmarkdownify、exe化はPyInstallerのonefile方式とする。既存YAMLの読込はPyYAML、画像形式・デコード検証はPillowを用途を限定して使用する。JSON・TOML・ハッシュ・パス・待機は標準ライブラリで扱う。リポジトリ専用の `.venv` を使用し、Pythonは `.python-version` に3.15.2を固定した。検証済み環境の版は `requirements-validation.txt` に固定した。PyYAMLはC拡張なしのSafeLoaderを使用する。本アプリとしての依存・配布確認は実装後にも行う。
 
 [PlaywrightのCDP接続](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp)には専用プロトコルより機能上の制限がある。[コンテキストのリクエストAPI](https://playwright.dev/python/docs/api/class-apirequestcontext)はCookieを共有し、画像取得の基本方式に使用する。変換・配布方式の根拠は[markdownify公式配布情報](https://pypi.org/project/markdownify/)と[PyInstallerの使用方法](https://pyinstaller.org/en/stable/usage.html)。公式資料確認日：2026-11-01。
 
@@ -153,6 +153,8 @@ Markdownは保存ルート直下の `タイトル-元URLのSHA-256先頭8桁.md`
 
 UTF-8・LFとし、先頭にYAMLフロントマターを置く。記事タイトルを最初のH1とし、本文に同一タイトルを重複追加しない。見出し・表・リンクを維持する。
 
+結合セルを持たない表はMarkdown表へ変換する。`rowspan` または `colspan` が2以上のセルを持つ表は、列位置や結合を失わないようHTMLのtableとしてMarkdown内へ保持する。HTML表内の本文画像もローカル相対参照へ変更し、内容ハッシュの計算では同じ画像内容ハッシュへ置換する。
+
 | キー | 内容 |
 | --- | --- |
 | `title` | 元の記事タイトル |
@@ -267,9 +269,9 @@ Cookie・認証ヘッダー・トークン・本文・生の例外文字列を�
 
 ### 12.1 実施状況
 
-[調査記録](knowledge-article-observations.md)に4記事・画像1件の限定観測を記録している。本文境界、1記事のAPI相関、1画像のページ内GETとコンテキストリクエストAPIによる取得を確認した。画像のHTTPヘッダーとPNG署名の不一致、250ms間隔の本文HTML一致も観測した。
+[調査記録](knowledge-article-observations.md)に6記事・画像1件の限定観測を記録している。本文境界、1記事のID相関、3記事のAPI値とShadow DOMの照合、1画像のページ内GETとコンテキストリクエストAPIによる取得を確認した。画像のHTTPヘッダーとPNG署名の不一致、250ms間隔の本文HTML一致も観測した。
 
-これらは全URL・全表示形式の保証ではなく、Python版・Markdown保存・exeでの再現確認でもない。実装・自動テスト・配布検証は未実施。調査履歴・実値の扱いは調査記録に集約し、本書の契約と区別する。
+これらは全URL・全表示形式の保証ではない。設計用のPython試行、ダミー画像・保存・通信・変換の検証と依存同梱の検証用exeは[技術確認記録](detailed-design-validation.md)10節以降に記載する。アプリ本体・その自動テスト・配布受入確認は未実施。調査履歴・実値の扱いは調査記録に集約し、本書の契約と区別する。
 
 ### 12.2 検証計画
 
@@ -298,6 +300,6 @@ Cookie・認証ヘッダー・トークン・本文・生の例外文字列を�
 | パス・保存名 | Windows制約、ファイル名・フォルダ衝突、元URL不明ファイルとの衝突時の一意接尾辞 |
 | 排他・外部編集 | ロック位置・取得順・別名パスの同一性・JSON置換と外部編集の競合範囲 |
 | 終了処理 | 手動中断・作業タブ閉鎖・切断・一時領域の後片付け失敗は終了コード1とする。残りの終了処理を試み、保存済み成果物と完了記録を維持する。具体的な手順は詳細設計12節 |
-| 環境・配布 | Python・依存版の固定、ドライバー同梱、Python未導入PCでの動作 |
+| 環境・配布 | 検証用の版固定と依存同梱exeは確認済み。本番の依存・ドライバー同梱・接続解放とPython未導入PCでの動作を確認 |
 
 要件に影響する判断は実装前に相談して要件定義書へ反映する。未確認の特殊形式・画面を推測して成功扱いにしない。サイト固有の未確定事項に依存する実装は、調査・ダミー検証を根拠に詳細設計を固定してから進める。
